@@ -1,0 +1,66 @@
+# Stage 1: vLLM nightly source
+FROM vllm/vllm-openai:nightly-8ee90c83f8e8b53f35ee3df3a86377ea5a587eea AS vllm-source
+
+# Verify and prepare files for copying
+RUN set -ex && \
+    echo "=== Stage 1: Checking nightly vLLM ===" && \
+    ls -la /usr/local/lib/python3.12/dist-packages/ | grep vllm && \
+    mkdir -p /vllm-pkg && \
+    cp -rv /usr/local/lib/python3.12/dist-packages/vllm /vllm-pkg/ && \
+    cp -rv /usr/local/lib/python3.12/dist-packages/vllm-*.dist-info /vllm-pkg/ && \
+    echo "=== Contents of /vllm-pkg ===" && \
+    ls -la /vllm-pkg/
+
+# Export requirements from the nightly image
+RUN pip freeze > /requirements-nightly.txt && \
+    cat /requirements-nightly.txt
+
+# Stage 2: Use gpustack runner as base
+FROM gpustack/runner:cuda12.9-vllm0.12.0
+
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+# Check what's in the base image BEFORE we modify
+RUN echo "=== Stage 2: Before cleanup ===" && \
+    ls -la /usr/local/lib/python3.12/dist-packages/ | grep vllm && \
+    pip show vllm | grep Version
+
+# Remove ALL old vllm files
+RUN set -ex && \
+    echo "=== Removing old vllm ===" && \
+    rm -rfv /usr/local/lib/python3.12/dist-packages/vllm && \
+    rm -rfv /usr/local/lib/python3.12/dist-packages/vllm-*.dist-info && \
+    echo "=== After cleanup ===" && \
+    ls -la /usr/local/lib/python3.12/dist-packages/ | grep vllm || echo "No vllm found (good!)"
+
+# Copy vllm package from nightly image
+COPY --from=vllm-source /vllm-pkg/vllm /usr/local/lib/python3.12/dist-packages/vllm
+COPY --from=vllm-source /vllm-pkg/vllm-0.14.0rc1.dev104+g8ee90c83f.dist-info /usr/local/lib/python3.12/dist-packages/vllm-0.14.0rc1.dev104+g8ee90c83f.dist-info
+
+# Copy and install requirements from the nightly image
+COPY --from=vllm-source /requirements-nightly.txt /tmp/requirements-nightly.txt
+
+# Install/upgrade all packages to match the nightly image
+# Using --ignore-installed to avoid conflicts, but skip torch/cuda packages to preserve base image's versions
+RUN grep -v -E "^(torch|nvidia|cuda|triton|flash)" /tmp/requirements-nightly.txt > /tmp/requirements-filtered.txt && \
+    pip install -r /tmp/requirements-filtered.txt && \
+    rm /tmp/requirements-*.txt
+
+# Verify the copy worked
+RUN echo "=== After copy ===" && \
+    ls -la /usr/local/lib/python3.12/dist-packages/ | grep vllm && \
+    cat /usr/local/lib/python3.12/dist-packages/vllm-*/METADATA | head -3
+
+## Copy the fixed GLM4 reasoning parser
+COPY glm4_moe_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/glm4_moe_reasoning_parser.py
+
+## Verify
+RUN echo "=== Final verification ===" && \
+    ls -la /usr/local/lib/python3.12/dist-packages/ | grep vllm
+
+WORKDIR /
+ENTRYPOINT [ "tini", "--" ]

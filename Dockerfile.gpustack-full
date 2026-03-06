@@ -1,0 +1,209 @@
+# GPUStack Runner with custom vLLM base image and GLM4 parser fix
+#
+# This Dockerfile uses vLLM nightly as base and adds gpustack components
+# 
+# Build command:
+#   docker build -f Dockerfile.gpustack-full -t nigelleong3737/runner:vllm-nightly-glm-fix --target=vllm-final .
+
+ARG PYTHON_VERSION=3.12
+ARG CMAKE_MAX_JOBS
+ARG CUDA_VERSION=12.9.1
+ARG CUDA_ARCHS
+
+# Use vLLM nightly as base
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:nightly-8ee90c83f8e8b53f35ee3df3a86377ea5a587eea
+
+ARG VLLM_VERSION=0.13.0
+ARG VLLM_TORCH_VERSION=2.9.0
+ARG VLLM_TORCH_CUDA_VERSION=${CUDA_VERSION}
+ARG VLLM_NVIDIA_GDRCOPY_VERSION=2.5.1
+ARG VLLM_NVIDIA_HPCX_VERSION=2.24.1_cuda12
+ARG VLLM_NVIDIA_NVSHMEM_VERSION=3.4.5
+ARG VLLM_AWS_EFA_VERSION=1.44.0
+ARG VLLM_PPLX_KERNEL_COMMIT=12cecfda
+ARG VLLM_DEEPEP_COMMIT=b57e5e21
+ARG VLLM_DEEPGEMM_COMMIT=9b680f42
+ARG VLLM_FLASHINFER_VERSION=0.5.3
+ARG VLLM_FLASHATTENTION_VERSION=2.8.3
+ARG VLLM_LMCACHE_VERSION=0.3.11
+ARG VLLM_MOONCAKE_VERSION=0.3.7.post2
+
+#
+# Stage: vLLM Final (simplified - uses pre-built vLLM nightly)
+#
+# This stage starts from vLLM nightly which already has:
+# - vLLM compiled
+# - FlashInfer
+# - FlashAttention
+# - Torch
+# - All core dependencies
+#
+# We only add:
+# - GLM4 parser fix
+# - Optional: gpustack extra components
+#
+
+FROM ${VLLM_BASE_IMAGE} AS vllm-final
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_PRERELEASE=allow \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+## Install uv if not present
+RUN <<EOF
+    # Install uv
+    if ! command -v uv &> /dev/null; then
+        pip install uv
+    fi
+EOF
+
+## Install NVIDIA HPC-X (for multi-node/RDMA support)
+ARG VLLM_NVIDIA_HPCX_VERSION
+
+ENV VLLM_NVIDIA_HPCX_VERSION=${VLLM_NVIDIA_HPCX_VERSION}
+
+RUN <<EOF
+    # NVIDIA HPC-X (optional - for multi-node support)
+    
+    # Check if already installed
+    if [[ -d /opt/hpcx ]]; then
+        echo "HPC-X already installed, skipping..."
+        exit 0
+    fi
+
+    # Install dependencies
+    apt-get update -y && apt-get install -y --no-install-recommends \
+        ca-certificates curl \
+        rdma-core rdmacm-utils infiniband-diags \
+        libibverbs1 libibverbs-dev \
+        librdmacm1 librdmacm-dev \
+        libibumad3 libibumad-dev \
+        libnl-route-3-200 libnl-3-200 \
+        ibverbs-utils ibverbs-providers || true
+
+    # Prepare
+    rm -f $(dpkg-query -L libibverbs-dev librdmacm-dev libibumad-dev 2>/dev/null | grep "\(\.so\|\.a\)$") || true
+    
+    CUDA_MAJOR=$(echo "${CUDA_VERSION}" | cut -d'.' -f1)
+    CUDA_MINOR=$(echo "${CUDA_VERSION}" | cut -d'.' -f2)
+    source /etc/os-release 2>/dev/null || true
+
+    # Get Download Version
+    if [[ "${VLLM_NVIDIA_HPCX_VERSION}" == *"_cuda"* ]]; then
+        VLLM_NVIDIA_HPCX_VERSION_DOWNLOAD=$(echo "${VLLM_NVIDIA_HPCX_VERSION}" | sed 's/_cuda.*//')
+    elif [[ "${VLLM_NVIDIA_HPCX_VERSION}" == *"rc"* ]]; then
+        VLLM_NVIDIA_HPCX_VERSION_DOWNLOAD=$(echo "${VLLM_NVIDIA_HPCX_VERSION}" | sed 's/rc.*//')
+    else
+        VLLM_NVIDIA_HPCX_VERSION_DOWNLOAD=${VLLM_NVIDIA_HPCX_VERSION}
+    fi
+
+    # Download and install
+    mkdir -p /opt/hpcx
+    curl --retry 3 --retry-connrefused -fL "https://content.mellanox.com/hpc/hpc-x/v${VLLM_NVIDIA_HPCX_VERSION}/hpcx-v${VLLM_NVIDIA_HPCX_VERSION_DOWNLOAD}-gcc-inbox-${ID:-ubuntu}${VERSION_ID:-22.04}-cuda${CUDA_MAJOR:-12}-$(uname -m).tbz" | tar -jxv -C /opt/hpcx --strip-components 1 || {
+        echo "HPC-X installation failed, continuing without it..."
+        rm -rf /opt/hpcx
+        exit 0
+    }
+
+    # Install
+    ln -sf /opt/hpcx/ompi /usr/local/mpi || true
+    ln -sf /opt/hpcx/ucx /usr/local/ucx || true
+    sed -i 's/^\(hwloc_base_binding_policy\) = core$/\1 = none/' /opt/hpcx/ompi/etc/openmpi-mca-params.conf 2>/dev/null || true
+    sed -i 's/^\(btl = self\)$/#\1/' /opt/hpcx/ompi/etc/openmpi-mca-params.conf 2>/dev/null || true
+    
+    cat <<EOT > /etc/ld.so.conf.d/hpcx.conf
+/opt/hpcx/clusterkit/lib
+/opt/hpcx/hcoll/lib
+/opt/hpcx/nccl_rdma_sharp_plugin/lib
+/opt/hpcx/ncclnet_plugin/lib
+/opt/hpcx/ompi/lib
+/opt/hpcx/sharp/lib
+/opt/hpcx/ucc/lib
+/opt/hpcx/ucx/lib
+EOT
+
+    # Fix DeepEP IBGDA symlink
+    ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so 2>/dev/null || true
+
+    ldconfig -v 2>/dev/null || true
+
+    # Cleanup
+    rm -rf /var/tmp/* /tmp/* /var/cache/apt
+EOF
+
+ENV PATH="/usr/local/mpi/bin:/usr/local/ucx/bin:${PATH}" \
+    OPAL_PREFIX=/opt/hpcx/ompi \
+    OMPI_MCA_coll_hcoll_enable=0
+
+## Install additional dependencies
+ARG VLLM_MOONCAKE_VERSION
+ARG CUDA_VERSION
+
+ENV VLLM_MOONCAKE_VERSION=${VLLM_MOONCAKE_VERSION} \
+    CUDA_VERSION=${CUDA_VERSION}
+
+RUN <<EOF
+    # Additional Dependencies
+
+    CUDA_MAJOR=$(echo "${CUDA_VERSION}" | cut -d'.' -f1)
+    CUDA_MINOR=$(echo "${CUDA_VERSION}" | cut -d'.' -f2)
+
+    # Install additional packages (some may already be installed)
+    pip install --no-cache-dir \
+        accelerate \
+        hf_transfer \
+        modelscope \
+        timm>=1.0.17 \
+        boto3 \
+        librosa \
+        soundfile || true
+
+    # Install CUDA-specific packages
+    pip install --no-cache-dir \
+        cuda-python==${CUDA_MAJOR}.${CUDA_MINOR} \
+        pynvml==${CUDA_MAJOR} || true
+
+    # Install mooncake (optional)
+    pip install --no-cache-dir \
+        mooncake-transfer-engine==${VLLM_MOONCAKE_VERSION} || true
+
+    # Cleanup
+    rm -rf /var/tmp/* /tmp/*
+EOF
+
+## Copy the fixed GLM4 reasoning parser
+COPY glm4_moe_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/glm4_moe_reasoning_parser.py
+
+## Install tini (required by gpustack)
+RUN <<EOF
+    apt-get update -y && apt-get install -y --no-install-recommends tini
+    rm -rf /var/cache/apt /var/lib/apt/lists/*
+EOF
+
+## Postprocess
+RUN <<EOF
+    # Verify installation
+    python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
+    python3 -c "from vllm.reasoning.glm4_moe_reasoning_parser import Glm4MoeModelReasoningParser; print('GLM4 parser loaded successfully')"
+EOF
+
+## Environment
+ENV PATH="/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}" \
+    RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 \
+    SAFETENSORS_FAST_GPU=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    RUNAI_STREAMER_MEMORY_LIMIT=0 \
+    RUNAI_STREAMER_LOG_TO_STDERR=1 \
+    RUNAI_STREAMER_LOG_LEVEL=INFO
+
+WORKDIR /
+ENTRYPOINT [ "tini", "--" ]
+

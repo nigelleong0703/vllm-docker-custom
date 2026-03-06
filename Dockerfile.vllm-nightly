@@ -1,0 +1,7 @@
+# Simple Dockerfile based on vLLM nightly image
+# Only adds the fixed GLM4 reasoning parser
+
+FROM vllm/vllm-openai:nightly-8ee90c83f8e8b53f35ee3df3a86377ea5a587eea
+
+# Copy the modified GLM4 reasoning parser with fixes for GLM4.5/4.7 compatibility
+COPY glm4_moe_reasoning_parser.py /usr/local/lib/python3.12/dist-packages/vllm/reasoning/glm4_moe_reasoning_parser.py
